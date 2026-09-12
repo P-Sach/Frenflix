@@ -11,7 +11,11 @@
     "test:cache": "node test/cache-harness.mjs",
     "test:media": "node test/make-media.mjs",
     "test:links": "node test/drive-links-harness.mjs",
-    "test:phase45": "node test/phase45-harness.mjs"
+    "test:phase45": "node test/phase45-harness.mjs",
+    "test:startup": "node test/startup-harness.mjs",
+    "test:pending": "node test/pending-play-harness.mjs",
+    "test:end": "node test/stream-end-harness.mjs",
+    "test:slow": "node test/slow-decoder-harness.mjs"
   },
   "dependencies": {
     "framer-motion": "^13.2.0",

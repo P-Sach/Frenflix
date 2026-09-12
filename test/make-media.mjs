@@ -47,6 +47,39 @@ if (!existsSync(join(out, 'video.webm'))) {
 if (!existsSync(join(out, 'audio.webm'))) {
   ff(['-f', 'lavfi', '-i', asrc, '-c:a', 'libopus', '-b:a', '128k', '-vn', join(out, 'audio.webm')]);
 }
+/**
+ * The calibration fixture, and why the bench is useless without it.
+ *
+ * One file carrying BOTH timecodes — the barcode picture and the burst audio —
+ * so the browser does its own A/V sync and the probe measures it through the
+ * identical instrument. Whatever that reads is the probe's own bias, and every
+ * other figure the bench prints has to be read against it: the Web Audio tap
+ * adds latency to what the probe "hears", and the browser does not know the
+ * probe added it.
+ *
+ * Muxed by stream copy from the two files above rather than re-encoded, so the
+ * timecodes are bit-identical to the ones the paired scenarios use. Missing
+ * this file does not fail the bench — `calibrate` just prints "no data" and
+ * every absolute number carries an unknown offset, which is exactly how a set
+ * of uncalibrated readings got trusted once already.
+ */
+if (!existsSync(join(out, 'muxed.webm'))) {
+  ff(['-i', join(out, 'video.webm'), '-i', join(out, 'audio.webm'),
+      '-c', 'copy', '-shortest', join(out, 'muxed.webm')]);
+}
+
+/**
+ * A dub that is shorter than the film.
+ *
+ * Not a contrived case: a separately sourced track is very often a second or
+ * two off the picture's length, and ending the pair on whichever stream runs
+ * out first meant a 6:13 video stopped at 6:11 with the last of the picture
+ * never shown. 68 s of sound against 70 s of picture.
+ */
+if (!existsSync(join(out, 'audio-short.webm'))) {
+  ff(['-i', join(out, 'audio.webm'), '-t', '68', '-c', 'copy', join(out, 'audio-short.webm')]);
+}
+
 // A realistic pair too: what people actually drop in.
 if (!existsSync(join(out, 'video.mp4'))) {
   ff(['-f', 'lavfi', '-i', vsrc, '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast',

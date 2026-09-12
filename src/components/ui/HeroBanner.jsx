@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { BiCalendar } from 'react-icons/bi';
 import { FaInfoCircle, FaPlay } from 'react-icons/fa';
 import { backdropFor } from '../../lib/thumbnails';
@@ -29,7 +30,16 @@ const MAX_SLIDES = 5;
  * and sits at z-10. They won, and became an invisible lid over the first row's
  * controls. Caught by a click that kept being intercepted by an <img>.
  */
-export default function HeroBanner({ entries, progressFor, onOpen }) {
+/*
+ * Play/Resume is a <Link>, not a button with a handler.
+ *
+ * It used to take an `onOpen` callback, the library page never passed one, and
+ * the headline control of the whole interface did nothing when clicked. A
+ * route is a route: a link cannot be wired up wrong, it cannot be forgotten by
+ * the next caller, and it ctrl-clicks and middle-clicks like everything else
+ * on the page. Same reasoning as ContentCard's stretched anchor.
+ */
+export default function HeroBanner({ entries, progressFor }) {
   const slides = useMemo(() => {
     const scored = entries.map((e) => ({ entry: e, progress: progressFor?.(e) }));
     const resuming = scored
@@ -144,14 +154,13 @@ export default function HeroBanner({ entries, progressFor, onOpen }) {
         </p>
 
         <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => onOpen(entry)}
+          <Link
+            to={`/watch/${entry.id}`}
             className="flex items-center gap-2.5 rounded-full bg-accent px-7 py-3 text-sm font-bold text-white shadow-lg shadow-red-700/40 transition-all duration-200 hover:scale-105 hover:bg-red-500"
           >
             <FaPlay className="text-xs" />
             {progress?.canResume ? 'Resume' : 'Play now'}
-          </button>
+          </Link>
           {progress?.canResume && (
             <span className="flex items-center gap-2 rounded-full border border-white/[0.15] bg-white/[0.1] px-6 py-3 text-sm font-semibold text-white backdrop-blur">
               <FaInfoCircle className="text-sm" />

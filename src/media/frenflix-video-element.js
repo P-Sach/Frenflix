@@ -146,8 +146,27 @@ export class FrenflixVideoElement extends HTMLElement {
   // ------------------------------------------------------------ frenflix API
 
   set sources(value) {
+    /*
+     * A play press made while the bytes were still arriving must not be lost.
+     *
+     * A Drive title has to be copied to this device in full before it can be
+     * played — Drive will not serve ranged reads to a browser — so the source
+     * can arrive minutes after the page does, and a viewer who pressed play in
+     * the meantime meant it. The controller clears its intent when the source
+     * changes (it has to: the new source may be a different film), so the
+     * intent is carried across here.
+     *
+     * Without this the press was swallowed, and worse: the controls layer had
+     * already been told playback was starting, nothing ever told it otherwise,
+     * and it sat on its loading spinner for ever. Hence the `pause` relay on
+     * the other branch — whatever happens, the controls' idea of paused is
+     * left matching this element's.
+     */
+    const resume = this._controller.wantPlay;
     this._controller.setSources(value || { videoUrl: '' });
     this.dispatchEvent(new Event('loadstart'));
+    if (resume) this.play().catch(() => this._relay('pause'));
+    else this._relay('pause');
   }
 
   get sources() {

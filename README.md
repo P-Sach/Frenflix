@@ -193,24 +193,111 @@ with the audio advancing at 0.056×** through the worst of it. That is the "soun
 record" symptom, and it is self-sustaining: playing drains the buffer, and `HAVE_FUTURE_DATA` is
 reached again long before there is enough to keep going.
 
-Both halves are fixed:
+The cure is hysteresis, which is how every real player behaves — and it is easy to get wrong in
+the direction that deadlocks, so the details matter:
 
 - Playback does not begin until **both** elements hold 0.35 s of buffered data, with a 4 s
-  timeout so a source that never reports a healthy buffer still plays. Starting them at the same
-  content position at the same instant also removes the catch-up ramp: previously the audio began
-  the moment it was asked while the video needed another 45 ms to decode, and the controller then
-  ran the picture at up to 1.10× for a second and a half closing a gap it had created itself.
-- A rebuffer resumes only once both sides hold **1.5 s**, never sooner than 250 ms after it
-  began, and never on a shortage that has lasted less than 300 ms — an ordinary seek drops
-  `readyState` for a moment and that is not starvation. One clean hold instead of a stutter.
-- The correction loop is switched off while either side is starved. Traced under a thin pipe,
-  correcting a starving video turned what should have been a buffering hold into the picture
-  jumping forward a second at a time while the sound ran on regardless.
+  timeout so a source that never reports a healthy buffer still plays. Note what this gate does
+  *not* do: it never pauses, it only withholds a start. `preload` is forced to `auto`, so a
+  paused element does keep filling — that is what makes the gate safe. (Gating on `preload`'s
+  default of `metadata` is the version that deadlocks: a paused element that has only fetched
+  metadata never fetches another byte, so it can never become ready and playback never starts.)
+  Starting both at the same content position at the same instant also removes the catch-up ramp:
+  previously the audio began the moment it was asked while the video needed another 45 ms to
+  decode, and the controller then ran the picture at up to 1.10× for a second and a half closing
+  a gap it had created itself.
+- A rebuffer resumes only once both sides hold **1.5 s**, and never sooner than 250 ms after it
+  began. One clean hold instead of a stutter.
+- A shortage is not starvation until it has lasted long enough to be sure. A seek drops
+  `readyState` on both sides for a moment, so a shortage **with something seeking** gets 300 ms
+  to settle. A shortage with nothing seeking is starvation from the first sample and gets 120 ms,
+  no more — because that grace is not free: while it runs, the starved side's picture is frozen
+  and the sound runs on, so every millisecond of it is a millisecond of gap to close afterwards.
+- Coming out of a hold, that gap is closed by moving **the sound back to the picture**, never the
+  picture forward to the sound. The instinct is the other way round, and it is wrong on a pipe
+  that is already too thin: a forward video seek flushes the decoder, throws away the buffer the
+  hold just spent 1.5 s accumulating, and walks straight back into the stall. Measured on a
+  3.4 Mbit/s file down a 2.5 Mbit/s pipe, that was the difference between a p95 lock error of
+  115 ms and 9 ms. The cost is a sub-120 ms replay of audio on each rebuffer, which is what a
+  rebuffer sounds like anyway.
+- The correction loop is switched off while either side is **starved**, not merely while it is
+  being held. Traced under a thin pipe, correcting a starving video turned what should have been
+  a buffering hold into the picture jumping forward a second at a time while the sound ran on
+  regardless.
 
-At the very start of a file there is a wrinkle: compensating the output path means the picture
-has to sit *behind* the sound, and at position zero there is nowhere behind to sit. The audio is
-nudged forward by that much instead, which costs a few tens of milliseconds of the opening and
-starts perfectly locked.
+### Streams that do not end together
+
+A separately sourced dub is very often a second or two off the length of the film it belongs to.
+The pair used to end on whichever stream ran out first, so a 6:13 video stopped at 6:11: the last
+of the picture was never shown, and because the sound is the master clock, the time display froze
+there too.
+
+The sound running out is a **demotion, not an ending**. `audioExhausted` is set, the picture plays
+on to its own end in silence, and `master` falls back to the picture for the remainder so the
+clock keeps moving. Seeking back into the film brings the track back into it. Everything about
+syncing — readiness, the correction loop, starting, holding — is conditioned on `audioActive`
+(there is a track and it has not run out) rather than on `hasExternalAudio`, because a track that
+has ended is not something to wait for, start or measure against. Not least: calling `play()` on
+an element that has ended restarts it from zero, which would drop the film back to its opening.
+
+`npm run test:end` plays 70 s of picture against 68 s of sound and asserts all of it.
+
+### A picture that is asked to play and does not
+
+Every readiness check in the controller asks an element whether it *could* play. None of them
+prove it *did*. Reported from a 108 MB 1080p H.264 file on Windows: two seconds of sound over a
+frozen first frame, then the picture arriving late. The correction loop only notices once the gap
+is seconds wide, and closing it then means seeking a decoder that is already struggling.
+
+So the start is supervised by the only evidence that settles it — whether the picture's position
+actually moved:
+
+- If the sound is running and the picture has not moved for 200 ms (after any deliberate hold),
+  the start is abandoned: both are paused and the **sound is moved back to where the picture
+  actually got to**, so nothing is skipped and the retry starts them together.
+- The retry is not a repeat of the same simultaneous start. It brings the picture up **alone** —
+  it is muted whenever there is an external track, so this is silent — and lets the sound join it
+  at the picture's position as soon as the position advances. The worst case becomes a picture
+  that starts a fraction of a second before its sound, which is the right way round. The picture
+  is never seeked here: it is the side that is struggling, and flushing its decoder is the last
+  thing it needs.
+
+Nothing here slows a healthy start — a healthy picture advances within a frame or two, and
+`startAborts` in the sync readout stays 0. `npm run test:slow` delays the video element's own
+`play()` by two seconds, which is exactly the shape of the fault: **2032 ms** of sound over a
+frozen picture without the watchdog, **~290 ms** with it, recovering to within 7 ms.
+
+### The first second
+
+Two things have to be right before the first frame goes up, and each of them was wrong in a way
+that showed as "out of sync at the start, then it settles".
+
+**There is nowhere behind position zero.** Compensating the output path means the picture has to
+sit *behind* the sound — at a wired 41 ms of output path, the frame that belongs with the first
+sound is the frame 41 ms before the first frame, and there isn't one. Expressed as a seek, that
+target is negative, it gets clamped to zero, and the picture starts a whole output path ahead of
+the sound while the rate loop claws it back over the following second. Measured: **+31 ms audible
+error a third of a second in, still +14 ms a second in**, and the controller's own per-frame
+figure sitting at +28 to +46 ms for the first 430 ms.
+
+The fix is to stop expressing it as a position. What cannot be done with a seek can be done with
+time: the audio starts, the first frame is *held still* for exactly the deficit, and the picture
+is released already locked. Nothing is skipped and nothing is visible — the opening frame sits
+there 41 ms longer than it otherwise would. Corrected, the same measurement reads flat from the
+first frame, matching a start from the middle of the file. `npm run test:startup` measures
+exactly this and prints both cases side by side, because this correction has now gone missing
+once and nothing was watching.
+
+**The output path is unknown at the instant it is needed.** `outputLatency` reads 0 until the
+context has pushed audio, and `getOutputTimestamp()` has nothing to report from a context that
+was resumed a moment ago — so the very first `play()` of a session compensated by zero however
+good the measurement became later. But the length of the output path is a property of the
+machine and the device, not of the playback run: the same laptop reads the same figure every
+time. So it is remembered (`localStorage`, `frenflix.outputPath`) and the next session's first
+pre-position is made against a real number. On a machine that has never played anything, `arm()`
+waits up to 160 ms for the clock to become readable before starting — a running context renders
+silence, so a usable timestamp normally arrives within a few render quanta. The sync readout
+says `remembered` rather than `measured` while the figure is last visit's.
 
 ---
 
@@ -236,8 +323,20 @@ npm run test:media           # generate the timecoded clips (needs ffmpeg)
 npm run test:sync            # every sync scenario
 node test/harness.mjs steady delay modes --headed
 npm run test:cache           # the Drive cache, driven against a local URL
+npm run test:startup         # the first second, from the top of a file and from the middle
+npm run test:pending         # play pressed before the file has finished downloading
+npm run test:end             # 70s of picture against 68s of sound
+npm run test:slow            # a picture whose decoder takes two seconds to move
+npm run test:links           # every Drive URL shape, and pairing across Drive files
+npm run test:phase45         # tracks, subtitles, queue and progress through the real UI
 node test/app-harness.mjs    # end to end through the real UI, H.264 + AAC
 ```
+
+Every one of those small harnesses exists because a real person hit the bug it covers, and each
+was verified to **fail with its fix removed** — checked, not assumed. That is the bar for adding
+one: a harness that passes both ways guards nothing. `phase45-harness.mjs` had been checking that
+the hero's Resume label was present and stopped one step short of clicking it, which is how a
+Play/Resume button that did nothing at all reached a user; it clicks it now.
 
 `app-harness.mjs` is the one that covers what a person touches: the drop zone, the name matcher,
 the library card, the route, media-chrome's play button, the `j`/`k` keys, the mode buttons and
@@ -246,7 +345,17 @@ bench never sees because it runs on WebM/Opus.
 
 **Calibrating the instrument.** `node test/harness.mjs calibrate` plays a *muxed* file — one
 file, the browser doing its own A/V sync — through the identical probe. Whatever that reads is
-the probe's own bias. It reads +48 ms at 1×, +96 ms at 1.5× and +134 ms at 2×, which is the Web
+the reference: the probe's own tap latency *plus* the output path the browser does not
+compensate, which are the same quantity seen twice. A paired scenario reading near zero is
+therefore correct — it is not "zero minus the bias" — and the calibration figure is what says how
+much better than the browser's own sync that is. On this container it reads +34 ms at 1× while
+the paired steady state reads +7 ms.
+
+`test/media/muxed.webm` is generated by `npm run test:media` by stream-copying the other two
+fixtures, so its timecodes are bit-identical to theirs. It used to be absent, `calibrate` printed
+"no data", and every absolute figure the bench produced carried an unknown offset — which is how
+a set of uncalibrated readings got trusted once already. If that line says "no data", stop and
+generate the fixture before reading anything else. It reads +48 ms at 1×, +96 ms at 1.5× and +134 ms at 2×, which is the Web
 Audio tap's own output latency expressed in media time: the browser does not know the probe
 added it, so it does not compensate. FrenFlix does know, and does.
 
@@ -281,6 +390,13 @@ grows with rate for that reason.
 that genuinely cannot keep up — went from **24 play / 22 pause with the audio at 0.056×** to
 8 play / 6 pause with the audio at a flat 1.000× between holds: real buffering, not a stutter.
 
+That last figure is now asserted rather than admired: `npm run test:startup` throttles the pipe
+to 320 KB/s and fails above 12 stop/starts in twenty seconds. With the hysteresis thresholds
+zeroed it reads 17 play / 16 pause and 9 sub-half-speed intervals; with them, 4 play / 3 pause
+and none. This regressed once — the behaviour described above was documented here while the code
+had gone back to a bare `readyState` gate — and the bench printed the churn all along without
+anything failing on it.
+
 ---
 
 # Google Drive
@@ -306,6 +422,19 @@ local file — instant seeking, no network during playback, and the sync engine 
 The copy outlives the tab. A title watched yesterday starts immediately today, which makes Drive
 titles the only ones that survive a reload; a dropped local file leaves nothing behind but an
 object URL, which dies with the page.
+
+**The wait has to be visible.** On a feature film that first copy is minutes, and a player
+sitting on its loading spinner for four minutes does not look like a download — it looks broken.
+So the watch page shows `DriveProgress`: which file, how far along, how fast, how long is left,
+and the reason it is happening at all. It was dropped from the page during the UI port and the
+result was reported, exactly as predicted, as an infinite loading loop.
+
+A play press made during that wait is honoured rather than discarded. The controller clears its
+play intent whenever the source changes — it has to, since the new source may be a different
+film — so `<frenflix-video>` carries the intent across, and playback begins the moment the copy
+lands. Without that the press was swallowed *and* the controls layer was left believing playback
+had started, with nothing ever telling it otherwise: a spinner that never cleared. That is what
+`npm run test:pending` holds in place.
 
 ## How it is written
 

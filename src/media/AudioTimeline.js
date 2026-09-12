@@ -65,6 +65,41 @@ const MAX_LAG = 0.6;
 /** Window for the render-clock anchor. Long enough to span several
  *  `currentTime` update quanta, short enough to follow a rate change. */
 const ANCHOR_WINDOW_MS = 400;
+/**
+ * Where the measured output path is remembered between visits, and why it is
+ * remembered at all.
+ *
+ * The length of the output path is a property of the machine and the device
+ * it is playing through, not of this playback run — the same wired laptop
+ * reports the same 60-odd milliseconds every time. But none of it is knowable
+ * at the instant playback starts: `outputLatency` reads 0 until the context
+ * has pushed audio, and `getOutputTimestamp()` has nothing to report from a
+ * context that has only just been resumed. So the first start of every
+ * session used to begin with a lag of zero, the picture was placed as though
+ * the sound came out instantly, and the rate loop spent the first second of
+ * the film pulling it back. That is precisely what "out of sync at the start"
+ * looks like.
+ *
+ * Remembering last time's measurement removes the guess: the very first
+ * pre-position of a session is made against a real figure.
+ */
+const LATENCY_KEY = 'frenflix.outputPath';
+/** How often the remembered figure is rewritten. It barely moves. */
+const PERSIST_EVERY_MS = 2000;
+
+function rememberedLatency() {
+  try {
+    const v = Number(window.localStorage.getItem(LATENCY_KEY));
+    return Number.isFinite(v) && v > 0 && v < MAX_LAG ? v : 0;
+  } catch {
+    return 0;   // private mode, or no storage at all
+  }
+}
+
+function remember(seconds) {
+  if (!(seconds > 0) || seconds >= MAX_LAG) return;
+  try { window.localStorage.setItem(LATENCY_KEY, seconds.toFixed(4)); } catch { /* no storage */ }
+}
 
 export const TimelineMode = {
   /** Element routed through Web Audio; the output path is measured. */
@@ -85,8 +120,14 @@ export class AudioTimeline extends EventTarget {
     this.mode = TimelineMode.ESTIMATED;
     /** Whether a tap should be attempted at all. */
     this.wantTap = true;
-    /** Reported output latency of the context, seconds. 0 until it is real. */
-    this.reportedLatency = 0;
+    /**
+     * Reported output latency of the context, seconds — 0 until it is real,
+     * which is why it starts at whatever this machine measured last time
+     * rather than at nothing. See LATENCY_KEY.
+     */
+    this.reportedLatency = rememberedLatency();
+    /** Whether the figure above is this session's measurement or last visit's. */
+    this.seeded = this.reportedLatency > 0;
     /** Last failure, for the diagnostics panel. */
     this.note = '';
 
@@ -95,6 +136,7 @@ export class AudioTimeline extends EventTarget {
     this._ts = null;         // cached getOutputTimestamp()
     this._tsAt = 0;
     this._lag = 0;           // measured render-to-audible gap, seconds
+    this._persistedAt = 0;
     this._rate = 1;
     this._onStateChange = () => this._pumpContext();
   }
@@ -133,7 +175,38 @@ export class AudioTimeline extends EventTarget {
     if (tap && !this.source && this.ctx.state === 'running') this._tap();
     if (!tap && !this.source) this.note = 'precise clock switched off';
     this._readLatency();
+    // Nothing remembered and nothing measured: this is the first play on this
+    // machine, and starting now would start with a lag of zero. A running
+    // context renders silence, so a usable timestamp arrives within a few
+    // render quanta — waiting that long, once, is invisible next to the click
+    // that caused it, and it is the difference between the first second of the
+    // film being in sync and being visibly out of it.
+    if (this._lag <= 0 && this.reportedLatency <= 0) await this._settleClock();
     return this.mode;
+  }
+
+  /**
+   * Wait, briefly, for the audio clock to become readable.
+   *
+   * Bounded hard: if the hardware will not report an output path before
+   * playback starts there is nothing to be gained by waiting longer, and the
+   * rate loop will close the gap from whatever it turns out to be.
+   *
+   * @returns {Promise<boolean>} whether a figure was obtained
+   */
+  async _settleClock(budgetMs = 160) {
+    if (!this.ctx) return false;
+    const until = performance.now() + budgetMs;
+    while (performance.now() < until) {
+      this._ts = null;          // the cache is what we are trying to fill
+      this._tsAt = 0;
+      this._timestamp();
+      this._readLatency();
+      if (this._lag > 0 || this.reportedLatency > 0) return true;
+      await new Promise((resolve) => { setTimeout(resolve, 16); });
+    }
+    if (!this.note) this.note = 'output path not readable before playback';
+    return false;
   }
 
   async _pumpContext() {
@@ -210,11 +283,21 @@ export class AudioTimeline extends EventTarget {
     const gap = this.ctx.currentTime - ts.contextTime;
     if (gap > 0 && gap < MAX_LAG) {
       this._lag = this._lag > 0 ? this._lag + (gap - this._lag) * LAG_SMOOTHING : gap;
+      this.seeded = false;
+      this._persist();
     }
     this._ts = ts;
     this._tsAt = now;
     this._readLatency();
     return ts;
+  }
+
+  /** Keep the measurement for next time — it is the same hardware. */
+  _persist() {
+    const now = performance.now();
+    if (now - this._persistedAt < PERSIST_EVERY_MS) return;
+    this._persistedAt = now;
+    remember(this._lag);
   }
 
   /**

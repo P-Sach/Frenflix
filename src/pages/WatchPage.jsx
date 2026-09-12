@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { BiChevronLeft, BiChevronRight } from 'react-icons/bi';
 import { FaArrowLeft, FaPlus } from 'react-icons/fa';
+import DriveProgress from '../components/DriveProgress';
 import PairPickerModal from '../components/PairPickerModal';
 import Player from '../components/Player';
 import { useLibrary } from '../context/LibraryContext';
@@ -126,6 +127,12 @@ export default function WatchPage() {
         <div className="mt-7">
           <Player entry={entry} onError={onError} onEnded={handleEnded} />
         </div>
+
+        {/* The wait a Drive title has and a dropped file does not. Without
+            this the first play of a Drive film is a player sitting on its
+            spinner for however long the copy takes, which looks broken and is
+            the single worst thing about the Drive path. */}
+        <DriveProgress entry={entry} />
 
         {error && (
           <p className="mt-4 rounded-xl border border-red-500/40 bg-red-600/10 px-4 py-3 text-sm text-red-300">

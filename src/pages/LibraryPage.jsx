@@ -27,7 +27,6 @@ export default function LibraryPage() {
     cacheUsage().then(setCached).catch(() => {});
   }, [entries]);
 
-  const open = (entry) => navigate(`/watch/${entry.id}`);
   const toggleQueue = (id) => (queue.includes(id) ? queueRemove(id) : queueAdd(id));
 
   const continueWatching = useMemo(() => entries

@@ -146,6 +146,32 @@ const heroResume = await page.evaluate(() => [...document.querySelectorAll('butt
   .some((n) => /Resume/.test(n.textContent)));
 ok('and the hero offers Resume', heroResume);
 
+/*
+ * Clicking it, not merely finding the label.
+ *
+ * The hero's Play/Resume control took an `onOpen` callback that the library
+ * page never passed, so the headline control of the whole interface silently
+ * did nothing. This harness had checked that the label was there and stopped
+ * one step short of the bug; a person found it instead. It is a <Link> now,
+ * which cannot be wired up wrong, and this clicks it.
+ */
+const heroTarget = await page.evaluate(() => {
+  const node = [...document.querySelectorAll('a, button')]
+    .find((n) => /^\s*(Resume|Play now)\s*$/.test(n.textContent));
+  if (!node) return null;
+  node.click();
+  return true;
+});
+await sleep(500);
+const heroRoute = await page.evaluate(() => location.pathname);
+ok('and clicking it actually opens the title', Boolean(heroTarget) && /^\/watch\//.test(heroRoute),
+  heroTarget ? heroRoute : 'no control found');
+
+// Back to the library for the rest of the run.
+await page.evaluate(() => document.querySelector('aside nav a[href="/"]').click());
+await page.waitForSelector('article');
+await sleep(400);
+
 await openTitle(/Phase Test/);
 await page.waitForSelector('frenflix-video');
 await page.waitForFunction(() => document.querySelector('frenflix-video')?.currentTime > 30, null, { timeout: 15000 })

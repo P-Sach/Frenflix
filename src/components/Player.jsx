@@ -447,7 +447,10 @@ export default function Player({ entry, onError, onEnded }) {
             </span>
             <span>p95 {sync.p95Ms.toFixed(0)} ms</span>
             <span>peak {sync.peakMs.toFixed(0)} ms</span>
-            <span>output path {sync.latencyMs.toFixed(0)} ms ({sync.clock})</span>
+            <span>
+              output path {sync.latencyMs.toFixed(0)} ms
+              ({sync.clockSeeded && sync.clock !== 'measured' ? 'remembered' : sync.clock})
+            </span>
             <span>offset {sync.totalOffsetMs.toFixed(0)} ms = yours {sync.userOffsetMs.toFixed(0)} + auto {sync.autoOffsetMs.toFixed(0)}</span>
             <span>trim {sync.trimPercent.toFixed(2)}%</span>
             {sync.clockNote && <span className="text-amber-400">{sync.clockNote}</span>}
