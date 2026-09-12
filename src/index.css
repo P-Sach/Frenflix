@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Global styles ported from WeFlix_v2 (MIT, Copyright (c) 2026 Phyo Min Thein).
+ * See ATTRIBUTION.md.
+ */
+
+:root {
+  color-scheme: dark;
+  --motion-fast: 160ms;
+  --motion-base: 220ms;
+  --motion-slow: 300ms;
+  --motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html, body, #root {
+  height: 100%;
+  background: #000;
+}
+
+body {
+  margin: 0;
+  font-family: Outfit, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+.fade-in,
+.animate-fadeIn {
+  animation: fadeIn var(--motion-slow) var(--motion-ease) both;
+}
+
+/* The hero's slide indicator fills over the dwell time. */
+@keyframes fillBar {
+  from { width: 0%; }
+  to { width: 100%; }
+}
+
+/* Rows scroll horizontally; a visible scrollbar under every row is noise. */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── media-chrome theming ───────────────────────────────────────────────── */
+
+media-controller {
+  --media-primary-color: #f5f5f5;
+  --media-secondary-color: rgba(255, 255, 255, 0.12);
+  --media-control-hover-background: rgba(255, 255, 255, 0.16);
+  --media-range-track-color: rgba(255, 255, 255, 0.4);
+  --media-range-track-background: rgba(0, 0, 0, 0.45);
+  --media-range-bar-color: #dc2626;
+  --media-range-thumb-background: #ffffff;
+  --media-font-family: Outfit, ui-sans-serif, system-ui, sans-serif;
+  display: block;
+}
+
+/* The control bar sits on top of arbitrary video. White-on-white is the
+   failure case, so the bar carries its own scrim and every glyph a shadow. */
+media-control-bar {
+  --media-control-background: transparent;
+  --media-control-hover-background: rgba(255, 255, 255, 0.2);
+  width: 100%;
+  padding: 28px 6px 4px;
+  background: linear-gradient(
+    to top,
+    rgba(0, 0, 0, 0.88) 0%,
+    rgba(0, 0, 0, 0.6) 45%,
+    rgba(0, 0, 0, 0) 100%
+  );
+}
+
+media-control-bar > * {
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.85));
+}
+
+media-time-range {
+  flex-grow: 1;
+}
+
+/* Same reasoning for the centred spinner: it appears over unknown video, so
+   it carries its own dark disc — scoped to when it is actually shown, since
+   the host element is always laid out and only the slotted icon fades. */
+media-loading-indicator {
+  --media-loading-indicator-icon-color: #ffffff;
+  border-radius: 9999px;
+  padding: 10px;
+  background: transparent;
+  transition: background-color 0.15s;
+}
+
+media-loading-indicator[medialoading]:not([mediapaused]) {
+  background: rgba(0, 0, 0, 0.55);
+  transition: background-color 0.15s 0.5s;
+}
