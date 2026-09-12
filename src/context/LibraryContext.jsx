@@ -1,11 +1,18 @@
-import { createContext, useCallback, useContext, useMemo, useReducer } from 'react';
+import {
+  createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState,
+} from 'react';
 import {
   classify, displayTitle, extensionOf, matchSubtitles, matchToVideos,
   RICH_SUBTITLE_EXT, RISKY_AUDIO_EXT, RISKY_VIDEO_EXT,
 } from '../lib/pairing';
 import {
-  createDriveAsset, createDriveSubtitleAsset, createLocalAsset, createSubtitleAsset,
+  createDriveAsset, createDriveSubtitleAsset, createLocalAsset, createRestoredAsset,
+  createRestoredSubtitleAsset, createSubtitleAsset, driveKey, localKey,
 } from '../lib/sources';
+import {
+  filesInDirectory, handlesSupported, pickFiles, pickFolder, requestRead,
+} from '../lib/handles';
+import { flush as flushLibrary, forget as forgetLibrary, load as loadLibrary, save as saveLibrary } from '../lib/persist';
 
 /**
  * The library is one atomic piece of state — videos, audios and the links
@@ -20,6 +27,21 @@ import {
  */
 const initialState = {
   videos: [], audios: [], subtitles: [], links: {}, subLinks: {}, rejected: [], queue: [],
+  /**
+   * The folder the library was pointed at, if any. One directory handle is
+   * worth more than every file handle put together: a single permission grant
+   * covers everything inside it, and it keeps covering files added later.
+   */
+  directory: null,
+  /**
+   * Assets are mutated in place when a file is reopened or dropped again —
+   * the asset identity has to survive, because the whole graph refers to it.
+   * That means the arrays do not change, so nothing would re-render. Bumping
+   * this is how a mutation becomes visible.
+   */
+  revision: 0,
+  /** Whether the saved library has been read yet. Nothing is saved before it has. */
+  restored: false,
 };
 
 /** Remove one audio id from every video's track list. */
@@ -170,8 +192,50 @@ function reducer(state, action) {
         links: withoutAudio(state.links, action.audioId),
       };
 
+    /**
+     * Everything that was saved, rebuilt.
+     *
+     * Replaces the state wholesale rather than merging: this runs once, before
+     * the user can have touched anything, and a merge would have to resolve
+     * conflicts that cannot exist.
+     */
+    case 'restore':
+      // If anything was added before the read finished, the user wins: their
+      // files are in front of them and a wholesale replace would take them
+      // away. Restoring is a one-shot on an empty library or not at all.
+      if (state.videos.length || state.audios.length || state.subtitles.length) {
+        return { ...state, restored: true };
+      }
+      return {
+        ...initialState,
+        videos: action.videos,
+        audios: action.audios,
+        subtitles: action.subtitles,
+        links: action.links,
+        subLinks: action.subLinks,
+        queue: action.queue,
+        directory: action.directory || null,
+        restored: true,
+      };
+
+    /** Nothing structural changed; an asset did. See `revision`. */
+    case 'touch':
+      return {
+        ...state,
+        videos: [...state.videos],
+        audios: [...state.audios],
+        subtitles: [...state.subtitles],
+        revision: state.revision + 1,
+      };
+
+    case 'setDirectory':
+      return { ...state, directory: action.directory };
+
+    case 'ready':
+      return state.restored ? state : { ...state, restored: true };
+
     case 'clear':
-      return initialState;
+      return { ...initialState, restored: true };
 
     case 'dismissRejected':
       return { ...state, rejected: [] };
@@ -183,29 +247,170 @@ function reducer(state, action) {
 
 const LibraryContext = createContext(null);
 
+/**
+ * Turn a saved record back into live assets and a live graph.
+ *
+ * The saved graph is expressed in file fingerprints; the reducer works in
+ * session ids, which are new every time the page loads. So the ids are minted
+ * here and the fingerprints translated through them once.
+ *
+ * Drive titles come back genuinely ready: their bytes are in the origin
+ * private file system already, so there is nothing to reopen and nothing to
+ * ask. Local ones come back as assets without files — see `createRestoredAsset`
+ * — carrying a handle when the browser gave one.
+ */
+function rebuild(snap) {
+  const videos = [];
+  const audios = [];
+  const subtitles = [];
+  const byKey = new Map();
+
+  const make = (rec) => (rec.origin === 'drive'
+    ? createDriveAsset({
+      id: rec.fileId,
+      name: rec.name,
+      size: rec.size,
+      mimeType: rec.mimeType,
+      resourceKey: rec.resourceKey,
+    }, rec.kind)
+    : createRestoredAsset({
+      key: rec.key,
+      name: rec.name,
+      kind: rec.kind,
+      size: rec.size,
+      handle: rec.handle || null,
+    }));
+
+  for (const rec of snap.videos || []) {
+    if (!rec?.key) continue;
+    const asset = make({ ...rec, kind: 'video' });
+    videos.push(asset);
+    byKey.set(rec.key, asset);
+  }
+  for (const rec of snap.audios || []) {
+    if (!rec?.key) continue;
+    const asset = make({ ...rec, kind: 'audio' });
+    audios.push(asset);
+    byKey.set(rec.key, asset);
+  }
+  for (const rec of snap.subtitles || []) {
+    if (!rec?.key) continue;
+    const asset = rec.origin === 'drive'
+      ? createDriveSubtitleAsset({ id: rec.fileId, name: rec.name, resourceKey: rec.resourceKey })
+      : createRestoredSubtitleAsset({ key: rec.key, name: rec.name, text: rec.text || '' });
+    subtitles.push(asset);
+    byKey.set(rec.key, asset);
+  }
+
+  const idOf = (key) => byKey.get(key)?.id;
+
+  const links = {};
+  for (const [videoKey, tracks] of Object.entries(snap.links || {})) {
+    const videoId = idOf(videoKey);
+    if (!videoId) continue;
+    const list = (tracks || []).map((t) => {
+      const audioId = idOf(t.audioKey);
+      return audioId ? { audioId, confidence: t.confidence, reason: t.reason } : null;
+    }).filter(Boolean);
+    if (list.length) links[videoId] = list;
+  }
+
+  const subLinks = {};
+  for (const [videoKey, keys] of Object.entries(snap.subLinks || {})) {
+    const videoId = idOf(videoKey);
+    if (!videoId) continue;
+    const ids = (keys || []).map(idOf).filter(Boolean);
+    if (ids.length) subLinks[videoId] = ids;
+  }
+
+  return {
+    videos,
+    audios,
+    subtitles,
+    links,
+    subLinks,
+    queue: (snap.queue || []).map(idOf).filter(Boolean),
+    directory: snap.directory || null,
+  };
+}
+
+/** A drop, a picker and a file input all reduce to this. */
+function normalizePicks(input) {
+  const arr = Array.isArray(input) ? input : Array.from(input || []);
+  return arr
+    .map((x) => (x && typeof x === 'object' && 'file' in x ? x : { file: x, handle: null }))
+    .filter((x) => x.file && typeof x.file.name === 'string');
+}
+
 export function LibraryProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+  /**
+   * The latest state, for callbacks that must not be rebuilt on every change.
+   * `addFiles` in particular is handed to a dozen components and needs to see
+   * the current library to know whether a dropped file belongs to a title that
+   * is already there.
+   */
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const [restoring, setRestoring] = useState(true);
 
   /** Ingest a FileList / File[] from a drop or a file input. */
-  const addFiles = useCallback((fileList) => {
-    const incoming = Array.from(fileList || []);
+  const addFiles = useCallback((input) => {
+    const picks = normalizePicks(input);
+    const current = stateRef.current;
+    const byKey = new Map();
+    for (const asset of [...current.videos, ...current.audios, ...current.subtitles]) {
+      if (asset.key) byKey.set(asset.key, asset);
+    }
+
     const videos = [];
     const audios = [];
     const subtitles = [];
     const skipped = [];
+    const reattached = [];
 
-    for (const file of incoming) {
+    for (const { file, handle } of picks) {
       const kind = classify(file.name);
-      if (kind === 'video') videos.push(createLocalAsset(file, 'video'));
-      else if (kind === 'audio') audios.push(createLocalAsset(file, 'audio'));
-      else if (kind === 'subtitle') subtitles.push(createSubtitleAsset(file));
-      else skipped.push(file.name);
+      if (!kind) { skipped.push(file.name); continue; }
+
+      /*
+       * The same file again.
+       *
+       * After a reload a title is here in every respect except its bytes —
+       * name, pairings, subtitle tracks, poster art, watch position. Dropping
+       * the file back in has to give those bytes to the asset the whole graph
+       * already points at, not create a second copy of the title beside it.
+       * The fingerprint (name, size, last-modified) is what makes them the
+       * same file; see `localKey`.
+       */
+      const existing = byKey.get(localKey(file));
+      if (existing) {
+        if (typeof existing.attach === 'function' && !existing.ready) {
+          existing.attach(file, handle);
+          reattached.push(existing);
+        }
+        continue;                          // already known, either way
+      }
+
+      if (kind === 'video') videos.push(createLocalAsset(file, 'video', handle));
+      else if (kind === 'audio') audios.push(createLocalAsset(file, 'audio', handle));
+      else {
+        const sub = createSubtitleAsset(file, handle);
+        // Read it now rather than on first use. It is kilobytes, and having the
+        // text on the asset is what lets the saved library carry subtitle
+        // tracks that come back needing no file and no permission.
+        sub.loadCues().catch(() => {});
+        subtitles.push(sub);
+      }
     }
 
-    dispatch({ type: 'add', videos, audios, subtitles, skipped });
+    if (videos.length || audios.length || subtitles.length || skipped.length) {
+      dispatch({ type: 'add', videos, audios, subtitles, skipped });
+    }
+    if (reattached.length) dispatch({ type: 'touch' });
     // Callers sometimes need the new assets themselves — dropping a subtitle
     // onto the watch page attaches it to *that* title regardless of its name.
-    return { videos, audios, subtitles, skipped };
+    return { videos, audios, subtitles, skipped, reattached };
   }, []);
 
   /**
@@ -215,12 +420,19 @@ export function LibraryProvider({ children }) {
    * Nothing is downloaded here — that happens when a title is played.
    */
   const addDriveFiles = useCallback((driveFiles) => {
+    const current = stateRef.current;
+    // A Drive title restored from the saved library is already here, and the
+    // browser dialog will happily offer it again.
+    const known = new Set(
+      [...current.videos, ...current.audios, ...current.subtitles].map((a) => a.key),
+    );
     const videos = [];
     const audios = [];
     const subtitles = [];
     const skipped = [];
 
     for (const f of driveFiles || []) {
+      if (known.has(driveKey(f.id))) continue;
       const byName = classify(f.name);
       const kind = byName
         || (f.mimeType?.startsWith('video/') && 'video')
@@ -262,8 +474,124 @@ export function LibraryProvider({ children }) {
   const clearAll = useCallback(() => {
     state.videos.forEach((v) => v.release?.());
     state.audios.forEach((a) => a.release?.());
+    forgetLibrary();
     dispatch({ type: 'clear' });
   }, [state.videos, state.audios]);
+
+  // ------------------------------------------------------- across sessions
+
+  /**
+   * Read the saved library once, on the way in.
+   *
+   * Two passes, and the order matters. First the graph, so the shelves are
+   * populated immediately — with poster art, since that is cached against the
+   * same fingerprints. Then the handles whose permission happens to have
+   * survived, which needs no gesture and no prompt, so a returning user often
+   * finds everything simply working.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const snap = await loadLibrary().catch(() => null);
+      if (cancelled) return;
+      if (!snap) {
+        dispatch({ type: 'ready' });
+        setRestoring(false);
+        return;
+      }
+      const built = rebuild(snap);
+      dispatch({ type: 'restore', ...built });
+
+      const withHandles = [...built.videos, ...built.audios].filter((a) => a.handle && !a.ready);
+      if (withHandles.length === 0) { setRestoring(false); return; }
+      const opened = await Promise.all(withHandles.map((a) => a.reopen().catch(() => false)));
+      if (cancelled) return;
+      if (opened.some(Boolean)) dispatch({ type: 'touch' });
+      setRestoring(false);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  /** Write it back on every change, coalesced. Never before it has been read. */
+  useEffect(() => {
+    if (!state.restored) return undefined;
+    saveLibrary(state, state.directory);
+    return undefined;
+  }, [state]);
+
+  /** `pagehide` rather than `unload`: reliable, and does not block the bfcache. */
+  useEffect(() => {
+    const onHide = () => { flushLibrary(); };
+    window.addEventListener('pagehide', onHide);
+    return () => window.removeEventListener('pagehide', onHide);
+  }, []);
+
+  /**
+   * Ask the browser for the files back. Must be called from a click.
+   *
+   * A folder is the case worth having: one prompt, and every title inside it
+   * comes back at once — including ones added to that folder since. Individual
+   * file handles cannot work that way, because the browser spends the click's
+   * user activation on the first prompt it shows, so they are offered one at a
+   * time and the caller is told how many are left.
+   *
+   * Nothing is awaited before the request itself, deliberately: an await can
+   * cost the user activation the request needs.
+   */
+  const restoreAccess = useCallback(async () => {
+    const current = stateRef.current;
+    const locals = [...current.videos, ...current.audios];
+    const locked = locals.filter((a) => a.availability === 'locked');
+
+    if (current.directory) {
+      const granted = await requestRead(current.directory);
+      if (granted === 'granted') {
+        const picks = await filesInDirectory(current.directory);
+        const byKey = new Map(locals.map((a) => [a.key, a]));
+        let count = 0;
+        for (const pick of picks) {
+          const asset = byKey.get(localKey(pick.file));
+          if (asset && !asset.ready) { asset.attach(pick.file, pick.handle); count += 1; }
+        }
+        // Files added to that folder since last time are new titles.
+        const known = new Set(locals.map((a) => a.key));
+        const fresh = picks.filter((p) => !known.has(localKey(p.file)));
+        if (count) dispatch({ type: 'touch' });
+        if (fresh.length) addFiles(fresh);
+        return { granted: count, added: fresh.length, remaining: locked.length - count };
+      }
+      return { granted: 0, added: 0, remaining: locked.length };
+    }
+
+    let count = 0;
+    for (const asset of locked) {
+      // eslint-disable-next-line no-await-in-loop
+      const ok = await asset.reopen({ ask: true });
+      if (ok) count += 1;
+      else break;                       // the gesture is spent; one click, one file
+    }
+    if (count) dispatch({ type: 'touch' });
+    return { granted: count, added: 0, remaining: locked.length - count };
+  }, [addFiles]);
+
+  /** Point the library at a folder — the entry point worth preferring. */
+  const addFolder = useCallback(async () => {
+    const picked = await pickFolder();
+    if (!picked) return null;
+    dispatch({ type: 'setDirectory', directory: picked.directory });
+    return addFiles(picked.picks);
+  }, [addFiles]);
+
+  /**
+   * The explicit file picker. Worth offering next to the drop zone for one
+   * reason only: a `<input type="file">` yields no handles, so files chosen
+   * that way cannot come back on their own in a later session.
+   */
+  const addViaPicker = useCallback(async () => {
+    const picks = await pickFiles();
+    if (picks.length === 0) return null;
+    return addFiles(picks);
+  }, [addFiles]);
 
   /** One row per video: the unit the library grid and the player deal in. */
   const entries = useMemo(() => {
@@ -288,6 +616,13 @@ export function LibraryProvider({ children }) {
         confidence: audioTracks[0]?.confidence ?? 0,
         reason: audioTracks[0]?.reason ?? null,
         fromDrive: video.origin === 'drive' || audio?.origin === 'drive',
+        /**
+         * 'ready' | 'locked' | 'missing' — whether this title can play right
+         * now, and if not, what it is waiting for. A Drive title is always
+         * ready: its bytes are on this device already, or will be fetched.
+         */
+        availability: video.availability || 'ready',
+        playable: (video.availability || 'ready') === 'ready',
         warnings: [
           RISKY_VIDEO_EXT.has(vExt) && `.${vExt} usually will not play in a browser`,
           audio && RISKY_AUDIO_EXT.has(aExt) && `.${aExt} audio usually will not decode in a browser`,
@@ -296,7 +631,29 @@ export function LibraryProvider({ children }) {
         ].filter(Boolean),
       };
     });
-  }, [state.videos, state.audios, state.subtitles, state.links, state.subLinks]);
+    // `state.revision` is in here on purpose: reopening a file mutates the
+    // asset in place, and nothing else about the state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.videos, state.audios, state.subtitles, state.links, state.subLinks, state.revision]);
+
+  /**
+   * What the library is waiting for, if anything. Drive titles never appear
+   * here — their bytes live on this device already.
+   */
+  const availability = useMemo(() => {
+    const locals = [...state.videos, ...state.audios].filter((a) => a.origin === 'local');
+    const locked = locals.filter((a) => a.availability === 'locked').length;
+    const missing = locals.filter((a) => a.availability === 'missing').length;
+    return {
+      locked,
+      missing,
+      waiting: locked + missing,
+      folder: Boolean(state.directory),
+      restoring,
+      supported: handlesSupported,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.videos, state.audios, state.directory, state.revision, restoring]);
 
   const looseAudios = useMemo(() => {
     const linked = new Set(Object.values(state.links).flat().map((t) => t.audioId));
@@ -340,6 +697,11 @@ export function LibraryProvider({ children }) {
     rejected: state.rejected,
     addFiles,
     addDriveFiles,
+    addFolder,
+    addViaPicker,
+    availability,
+    restoreAccess,
+    restored: state.restored,
     linkPair,
     unlinkPair,
     linkSubtitle,
@@ -359,7 +721,8 @@ export function LibraryProvider({ children }) {
     nextAfter,
     prevBefore,
   }), [entries, state.queue, looseAudios, looseSubtitles, state.audios, state.subtitles,
-    state.rejected, addFiles, addDriveFiles, linkPair, unlinkPair, linkSubtitle, removeSubtitle,
+    state.rejected, state.restored, addFiles, addDriveFiles, addFolder, addViaPicker,
+    availability, restoreAccess, linkPair, unlinkPair, linkSubtitle, removeSubtitle,
     removeVideo, removeAudio, clearAll, dismissRejected, getEntry, setPrimaryAudio, unlinkAudio,
     queueSet, queueAdd, queueRemove, queueMove, queueClear, nextAfter, prevBefore]);
 

@@ -6,6 +6,7 @@ import DriveProgress from '../components/DriveProgress';
 import PairPickerModal from '../components/PairPickerModal';
 import Player from '../components/Player';
 import { useLibrary } from '../context/LibraryContext';
+import { readDrop } from '../lib/handles';
 import { backdropFor } from '../lib/thumbnails';
 import { formatBytes } from '../lib/sources';
 
@@ -21,7 +22,7 @@ export default function WatchPage() {
   const { id } = useParams();
   const {
     getEntry, addFiles, linkSubtitle, linkPair, nextAfter, prevBefore,
-    queue, queueRemove, queueAdd,
+    queue, queueRemove, queueAdd, restored, restoreAccess,
   } = useLibrary();
   const navigate = useNavigate();
   const entry = getEntry(id);
@@ -54,19 +55,32 @@ export default function WatchPage() {
   }, [autoAdvance, nextId, navigate]);
 
   /** Files dropped here belong to *this* title, whatever they are called. */
-  const attach = useCallback((files) => {
+  const attach = useCallback((picks) => {
     if (!entry) return;
-    const added = addFiles(files);
+    const added = addFiles(picks);
+    // A file that rejoined an existing title is not a new one to link up — it
+    // already belongs where it belonged before the tab closed.
+    if (added.reattached?.length) return;
     added.subtitles.forEach((s) => linkSubtitle(entry.id, s.id));
     if (added.audios.length > 0) linkPair(entry.id, added.audios[0].id);
   }, [entry, addFiles, linkSubtitle, linkPair]);
+
+  // A direct link, opened before the saved library has been read.
+  if (!entry && !restored) {
+    return (
+      <div className="mx-auto max-w-3xl px-6 py-24 text-center">
+        <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-white/15 border-t-accent" />
+        <p className="mt-5 text-sm text-gray-500">Opening your library…</p>
+      </div>
+    );
+  }
 
   if (!entry) {
     return (
       <div className="mx-auto max-w-3xl px-6 py-24 text-center">
         <h1 className="text-2xl font-black text-white">Nothing to play here</h1>
         <p className="mt-2 text-sm text-gray-500">
-          Local files are held in memory, so a page reload empties the library.
+          This title is not in the library on this device.
         </p>
         <Link to="/" className="mt-8 inline-block rounded-full bg-accent px-6 py-2.5 text-sm font-bold text-white">
           Back to the library
@@ -89,7 +103,12 @@ export default function WatchPage() {
       className="relative min-h-screen"
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
-      onDrop={(e) => { e.preventDefault(); setDragging(false); attach(e.dataTransfer.files); }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragging(false);
+        // Read the item list before yielding: it is emptied on the first await.
+        readDrop(e.dataTransfer).then(({ picks }) => attach(picks));
+      }}
     >
       {/* Full-bleed backdrop behind the header. */}
       <div className="pointer-events-none absolute inset-x-0 top-0 h-[420px] overflow-hidden">
@@ -125,7 +144,38 @@ export default function WatchPage() {
             second border here enclosed the sync panels too, which made them
             look like part of the video. */}
         <div className="mt-7">
-          <Player entry={entry} onError={onError} onEnded={handleEnded} />
+          {entry.playable ? (
+            <Player entry={entry} onError={onError} onEnded={handleEnded} />
+          ) : (
+            /*
+             * Deliberately instead of the player, not above it. Handing the
+             * player a source it cannot open makes it report a decode failure,
+             * which is both wrong and alarming — the file is fine, the page
+             * just does not hold it open any more.
+             */
+            <section className="rounded-xl border border-amber-500/30 bg-amber-500/[0.07] px-6 py-10 text-center">
+              <h2 className="text-lg font-bold text-white">
+                {entry.availability === 'locked'
+                  ? 'This one needs permission again'
+                  : 'This one needs its file again'}
+              </h2>
+              <p className="mx-auto mt-2 max-w-md text-sm text-amber-200/80">
+                {entry.availability === 'locked'
+                  ? 'The file is where it was — browsers just do not keep file permissions across a restart. One click and it plays.'
+                  : 'Drop the file anywhere on this page and it will rejoin this title, with its dub, subtitles and your place in it intact.'}
+              </p>
+              {entry.availability === 'locked' && (
+                <button
+                  type="button"
+                  onClick={() => restoreAccess()}
+                  className="mt-6 rounded-full bg-accent px-6 py-2.5 text-sm font-bold text-white transition-colors hover:bg-red-500"
+                >
+                  Reopen it
+                </button>
+              )}
+              <p className="mt-5 text-xs text-amber-200/50">{entry.video.name}</p>
+            </section>
+          )}
         </div>
 
         {/* The wait a Drive title has and a dropped file does not. Without

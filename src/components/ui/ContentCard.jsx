@@ -121,6 +121,20 @@ const ContentCard = memo(({
             </div>
           )}
 
+          {/*
+            Remembered but not openable yet. The poster, the pairings and the
+            watch position all survived the tab closing; only the bytes need
+            fetching back. Saying so on the card is what stops it looking like
+            a title that has gone wrong.
+          */}
+          {entry.availability && entry.availability !== 'ready' && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-black/75 px-2 py-1.5 text-center backdrop-blur-sm">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                {entry.availability === 'locked' ? 'needs permission' : 'file not loaded'}
+              </span>
+            </div>
+          )}
+
           <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center gap-3 bg-black/50 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
             <div className="flex h-12 w-12 scale-75 transform items-center justify-center rounded-full bg-accent shadow-lg shadow-red-700/50 transition-transform duration-200 group-hover:scale-100">
               <FaPlay className="ml-0.5 text-sm text-white" />

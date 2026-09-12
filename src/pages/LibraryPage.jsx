@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import DropZone from '../components/DropZone';
 import PairPickerModal from '../components/PairPickerModal';
+import RestoreBar from '../components/RestoreBar';
 import ContentGrid from '../components/ui/ContentGrid';
 import ContentRow from '../components/ui/ContentRow';
 import HeroBanner from '../components/ui/HeroBanner';
@@ -14,7 +15,7 @@ import { useWatchProgress } from '../lib/useWatchProgress';
 export default function LibraryPage() {
   const {
     entries, looseAudios, looseSubtitles, rejected, dismissRejected, clearAll,
-    queue, queueAdd, queueRemove, queueSet, queueClear, removeVideo,
+    queue, queueAdd, queueRemove, queueSet, queueClear, removeVideo, restored,
   } = useLibrary();
   const { forEntry, refresh, count } = useWatchProgress();
   const { openDrive } = useOutletContext() || {};
@@ -43,6 +44,18 @@ export default function LibraryPage() {
   const withDubs = useMemo(() => entries.filter((e) => (e.audioTracks?.length || 0) > 0), [entries]);
 
   const empty = entries.length === 0 && looseAudios.length === 0;
+
+  // Not "empty" until the saved library has actually been read — otherwise a
+  // returning user sees "Your library is empty" flash before their shelves
+  // appear, which is exactly the thing this whole feature is fixing.
+  if (!restored) {
+    return (
+      <div className="mx-auto max-w-3xl px-6 py-24 text-center">
+        <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-white/15 border-t-accent" />
+        <p className="mt-5 text-sm text-gray-500">Opening your library…</p>
+      </div>
+    );
+  }
 
   if (empty) {
     return (
@@ -76,6 +89,8 @@ export default function LibraryPage() {
       <HeroBanner entries={entries} progressFor={forEntry} />
 
       <div className="relative z-10 pt-10 pb-16">
+        <RestoreBar />
+
         {rejected.length > 0 && (
           <div className="mx-4 mb-8 flex items-start justify-between gap-4 rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 sm:mx-6">
             <p className="text-sm text-amber-300">

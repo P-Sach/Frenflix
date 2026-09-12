@@ -15,7 +15,8 @@
     "test:startup": "node test/startup-harness.mjs",
     "test:pending": "node test/pending-play-harness.mjs",
     "test:end": "node test/stream-end-harness.mjs",
-    "test:slow": "node test/slow-decoder-harness.mjs"
+    "test:slow": "node test/slow-decoder-harness.mjs",
+    "test:persist": "node test/persist-harness.mjs"
   },
   "dependencies": {
     "framer-motion": "^13.2.0",

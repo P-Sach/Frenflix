@@ -665,6 +665,85 @@ nested inside an anchor — which is invalid — is avoided.
 **A phone gets a bottom bar.** The original's rail is `hidden md:flex` with nothing in its place,
 which leaves small screens with no navigation at all.
 
+# The library between sessions
+
+Everything here is client-side by design. That used to mean the library evaporated on reload —
+the titles, the dub pairings, the subtitle links and the queue all lived in a reducer, and the
+files themselves were object URLs, which die with the page. Watch positions and poster art
+already survived, and the reason they did is the reason the rest now can.
+
+## Fingerprints, not session ids
+
+`progress.js` and `thumbnails.js` are keyed on a **file fingerprint** — a Drive file on its Drive
+id, a local file on `name|size|lastModified`. That is stable across sessions, across the same
+file being added again, and it costs nothing to compute where hashing the bytes of a 4 GB film
+would cost minutes.
+
+So the saved library (`lib/persist.js`, one IndexedDB record) is the whole graph expressed in
+fingerprints: which dub and which subtitle tracks belong to which title, and in what order, plus
+the queue. Session ids are regenerated on every load and storing them would store nothing, so
+they are minted fresh on the way back in and the fingerprints translated through them once.
+
+Subtitle text is stored inline. A subtitle file is kilobytes, and storing the text means
+subtitle tracks come back needing no file and no permission at all — the right trade at that
+size.
+
+## Getting the files themselves back
+
+A browser will not let a page keep a path, and a `File` cannot be written down. What it will do
+is grant a **`FileSystemFileHandle`** — a capability that *is* structured-cloneable, so it can be
+stored in IndexedDB and used in a later session. That is the whole reason the saved library is
+IndexedDB and not `localStorage`: a handle cannot survive being turned into a string.
+
+Handles arrive from three places, and they are not equivalent:
+
+| | handle? | survives a restart |
+|---|---|---|
+| drag and drop | yes, via `getAsFileSystemHandle()` | one click per file |
+| **a folder** (`showDirectoryPicker`) | **yes, one for everything in it** | **one click, whole library** |
+| `<input type="file">` | no | the file has to be dropped again |
+
+A directory handle is worth more than every file handle put together, and not for tidiness: the
+browser spends the click's *user activation* on the first permission prompt it shows, so asking
+for twenty file handles in one click only ever gets the first. One folder is one prompt. It also
+keeps covering files added to that folder later, which is why "Add a folder" is the primary
+button on the drop zone and drag-and-drop quietly collects handles alongside the files it always
+did.
+
+Permission is re-granted, not permanent: within a session a granted handle stays granted, and
+after a browser restart `queryPermission` usually reports `prompt` again. On load, every stored
+handle is tried silently first — no gesture needed, and a returning user often finds everything
+simply working — and only what is still locked reaches the restore bar.
+
+## When there is no handle at all
+
+Firefox and Safari have no File System Access API, and a file input yields no handle anywhere. So
+the fallback is not an error state, it is a nearly-complete library: every title is on the shelf
+with its real poster art, its pairings, its subtitle tracks, its queue position and where you
+were up to. Only the bytes are missing, the card says so, and dropping the same file back in
+**rejoins the title it already belonged to** rather than adding a second copy beside it — the
+fingerprint is what makes them the same file.
+
+Drive titles need none of this. Their bytes are already in the origin private file system
+(`drive/cache.js`), so they come back ready to play with nothing asked of anyone.
+
+## Measured
+
+`npm run test:persist` builds a library through a file input — deliberately the *worst* path,
+since it yields no handles — reloads the page, and checks what came back. With persistence
+removed the reload leaves **0 titles and 0 cards**; with it, the same two titles, the dub pairing,
+the subtitle track, the queue, the continue-watching row and 8 posters straight out of the cache.
+Then it re-adds the same files and asserts no duplicate titles appeared and nothing is marked
+unavailable any more.
+
+The handle round-trip is proven separately, with the one kind of handle a page can make for
+itself: an OPFS file handle is a real `FileSystemFileHandle`, structured-cloneable the same way,
+and always permitted. Stored in IndexedDB in one page and reopened in a fresh one, it gives back
+the same bytes — which is precisely the mechanism that carries a dropped file across a browser
+restart.
+
+---
+
 # Known limits
 
 - **Browser codec support is the real constraint.** `.mkv`, `.avi`, AC-3, E-AC-3 and DTS are not
@@ -672,9 +751,14 @@ which leaves small screens with no navigation at all.
   often right there and only the container is wrong. MP4/WebM with AAC or Opus works.
 - **A Drive file has to come down in full before it plays.** Drive gives browsers no ranged
   reads, so there is no way to stream it and no way to resume a failed transfer.
-- The local-file library lives in memory: object URLs die on reload, so a refresh empties it.
-  Persisting handles needs the File System Access API. Drive titles are cached on disk and do
-  survive.
+- **Re-granting file permission needs a click, and there is no way around it.** The library
+  itself survives a restart in full; the *files* need one click when their handles have lapsed,
+  and one click per file unless the library was pointed at a folder. In Firefox and Safari, where
+  there is no File System Access API, local files have to be dropped in again — they rejoin their
+  titles automatically, but the drop is unavoidable.
+- Local files are not copied anywhere. That is deliberate — duplicating a 108 MB film into
+  browser storage to avoid a click is a poor trade — but it does mean a file that is moved,
+  renamed or deleted outside FrenFlix comes back as unavailable rather than following its handle.
 - Audio and subtitle delays reset per title and are not remembered between sessions.
 - Four files are superseded by `src/components/ui/` and no longer imported anywhere —
   `components/PosterCard.jsx`, `PosterRow.jsx`, `Hero.jsx` and `LibraryGrid.jsx`. They are safe

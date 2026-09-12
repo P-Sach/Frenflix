@@ -9,6 +9,7 @@
  */
 
 import { parseSubtitles, readSubtitleFile } from './subtitles.js';
+import { fileFromHandle, readPermission, requestRead } from './handles.js';
 import { ensureCached, subscribe as subscribeCache, stateOf, cancel as cancelCache } from './drive/cache.js';
 import { mediaUrl, fetchSmallFile } from './drive/api.js';
 import { ensureToken } from './drive/auth.js';
@@ -44,35 +45,92 @@ export const localKey = (file) => `local:${file.name}|${file.size}|${file.lastMo
 export const driveKey = (fileId) => `drive:${fileId}`;
 
 /**
- * Wrap a File/Blob from a drop or file input.
+ * A file on this machine.
  *
  * Object URLs are the whole reason local playback is instant at any size: the
  * browser reads straight off disk, so seeking a 40GB file is as fast as seeking
  * a 40MB one and not a single byte crosses the network.
  *
- * @param {File} file
- * @param {'video'|'audio'|'subtitle'} kind
- * @returns {MediaAsset}
+ * The `File` may be absent. That is what a title restored from a previous
+ * session looks like: its name, size, pairings, poster art and watch position
+ * all came back from IndexedDB, but the bytes need reopening — from a stored
+ * `FileSystemFileHandle` if there is one, otherwise by the file being dropped
+ * again. `availability` is the one thing the UI reads to know which it is.
  */
-export function createLocalAsset(file, kind) {
+function makeFileAsset({
+  key, name, kind, size = 0, file = null, handle = null,
+}) {
   const id = nextId('local');
-  return {
+  let current = file;
+  const asset = {
     id,
-    key: localKey(file),
-    name: file.name,
+    key,
+    name,
     kind,
     origin: 'local',
-    size: file.size ?? 0,
-    file,
-    ready: true,
+    size,
+    handle,
+    get file() { return current; },
+    get ready() { return Boolean(current); },
+    /**
+     * 'ready'   — the bytes are here
+     * 'locked'  — there is a stored handle, and the browser wants a click
+     * 'missing' — no handle; this file has to be dropped again
+     */
+    get availability() {
+      if (current) return 'ready';
+      return asset.handle ? 'locked' : 'missing';
+    },
+
+    /** Promote to usable: the same file dropped again, or a granted handle. */
+    attach(nextFile, nextHandle = null) {
+      if (!nextFile) return asset;
+      asset.release();                 // the old URL points at the old File
+      current = nextFile;
+      asset.size = nextFile.size ?? asset.size;
+      if (nextHandle) asset.handle = nextHandle;
+      return asset;
+    },
+
+    /**
+     * Re-acquire the file from the stored handle.
+     *
+     * `ask` may only be true inside a user gesture, and only for one handle
+     * per gesture — see handles.js on why a directory handle is worth so much
+     * more than a pile of file handles.
+     *
+     * @returns {Promise<boolean>} whether the bytes are available now
+     */
+    async reopen({ ask = false } = {}) {
+      if (current) return true;
+      if (!asset.handle) return false;
+      let state = await readPermission(asset.handle);
+      if (state !== 'granted' && ask) state = await requestRead(asset.handle);
+      if (state !== 'granted') return false;
+      const got = await fileFromHandle(asset.handle);
+      if (!got) return false;          // moved, renamed or deleted since
+      current = got;
+      asset.size = got.size ?? asset.size;
+      return true;
+    },
+
     async resolveUrl() {
+      if (!current && !(await asset.reopen())) {
+        const err = new Error(asset.handle
+          ? `${name} needs permission again before it can play.`
+          : `${name} is not held by this page any more — drop the file again.`);
+        err.name = 'AssetUnavailable';
+        err.availability = asset.availability;
+        throw err;
+      }
       let url = objectUrls.get(id);
       if (!url) {
-        url = URL.createObjectURL(file);
+        url = URL.createObjectURL(current);
         objectUrls.set(id, url);
       }
       return url;
     },
+
     release() {
       const url = objectUrls.get(id);
       if (url) {
@@ -81,6 +139,34 @@ export function createLocalAsset(file, kind) {
       }
     },
   };
+  return asset;
+}
+
+/**
+ * Wrap a File from a drop or a file input.
+ *
+ * @param {File} file
+ * @param {'video'|'audio'|'subtitle'} kind
+ * @param {FileSystemFileHandle|null} handle when the browser offered one
+ * @returns {MediaAsset}
+ */
+export function createLocalAsset(file, kind, handle = null) {
+  return makeFileAsset({
+    key: localKey(file),
+    name: file.name,
+    kind,
+    size: file.size ?? 0,
+    file,
+    handle,
+  });
+}
+
+/**
+ * A title remembered from a previous session whose bytes are not here yet.
+ * @param {{key:string,name:string,kind:string,size?:number,handle?:object}} meta
+ */
+export function createRestoredAsset(meta) {
+  return makeFileAsset({ ...meta, file: null });
 }
 
 /**
@@ -91,15 +177,47 @@ export function createLocalAsset(file, kind) {
  * @param {File} file
  * @returns {MediaAsset & {loadCues: () => Promise<Array>}}
  */
-export function createSubtitleAsset(file) {
-  const asset = createLocalAsset(file, 'subtitle');
+export function createSubtitleAsset(file, handle = null) {
+  const asset = createLocalAsset(file, 'subtitle', handle);
   let cues = null;
   asset.loadCues = async () => {
     if (cues) return cues;
-    cues = parseSubtitles(await readSubtitleFile(file));
+    // The text is kept on the asset so it can be written into the saved
+    // library. A subtitle file is kilobytes, so storing the text itself means
+    // subtitle tracks come back in a later session with no handle and no
+    // permission at all — the right trade for something this small.
+    asset.text = await readSubtitleFile(asset.file);
+    cues = parseSubtitles(asset.text);
     return cues;
   };
   return asset;
+}
+
+/**
+ * A subtitle track restored from the saved library. Its text was stored, so
+ * unlike video and audio it needs nothing reopened and no permission.
+ * @param {{key:string,name:string,text:string}} meta
+ */
+export function createRestoredSubtitleAsset({ key, name, text = '' }) {
+  const id = nextId('localsub');
+  let cues = null;
+  return {
+    id,
+    key,
+    name,
+    kind: 'subtitle',
+    origin: 'local',
+    size: text.length,
+    text,
+    ready: true,
+    availability: 'ready',
+    async loadCues() {
+      if (!cues) cues = parseSubtitles(text);
+      return cues;
+    },
+    async resolveUrl() { throw new Error('Subtitles are read as text, not as a URL.'); },
+    release() {},
+  };
 }
 
 /**

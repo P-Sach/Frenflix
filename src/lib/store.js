@@ -13,8 +13,15 @@
  */
 
 const DB_NAME = 'frenflix';
-const DB_VERSION = 1;
-export const STORES = { progress: 'progress', posters: 'posters' };
+const DB_VERSION = 2;
+/**
+ * `library` holds one record: the whole library graph, plus the
+ * `FileSystemFileHandle`s that let the files themselves be reopened in a later
+ * session. Handles are structured-cloneable, which is the entire reason this
+ * is IndexedDB and not localStorage — a handle cannot survive being turned
+ * into a string. See lib/persist.js.
+ */
+export const STORES = { progress: 'progress', posters: 'posters', library: 'library' };
 
 let dbPromise = null;
 
